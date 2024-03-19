@@ -1,0 +1,212 @@
+local inst = mc.mcGetInstance()
+
+local toolSetterX = 2360.0	--G53 position
+local toolSetterY =	1292.0	--G53 position
+local toolSetterZ = -158.1893	--G53 position
+
+local fastFeed = 1000.0
+local slowFeed = 250.0
+
+local bareSpindleD = 25.0 	-- bare spindle diameter... also tool zero
+
+local toolSetterD = 20.0 	--tool setter diameter
+local zOverShoot = 3.0   	--how far is too far?
+local zRetract = 40.0		-- how far to retract between probing moves DON'T BE STINGY!!!
+
+local zSafe = 0.0			-- safe z height for sideways movements
+
+local probeCode = 31 		-- probe signal code for tool height setter
+
+function isHomed()
+	local check = true
+	local errmsg = 'ERROR: Machine is not homed on all active axes' --Default error message
+	for i = 0, mc.MC_MAX_AXES, 1 do --start, end, increment
+		local axisEnabled, rc = mc.mcAxisIsEnabled(inst, i)
+		if axisEnabled then
+			local axisHomed, rc = mc.mcAxisIsHomed(inst,i)
+			if not axisHomed then
+				mc.mcCntlSetLastError(inst, errmsg)
+				mc.mcCntlEStop(inst)
+				return (false)
+			end	
+		end
+	end
+	return check
+end	
+
+----------- Check Probe State -----------
+--We can use this function to return the current state CheckProbe()
+--or check it for active CheckProbe(1)
+--or check it for inactive CheckProbe(0)
+function CheckProbe(state)
+
+	----- Select probe signal depending on probe code selected
+	ProbeSig = mc.ISIG_PROBE --Default probe signal, G31
+	if probeCode == 31.1 then
+		ProbeSig = mc.ISIG_PROBE1
+	elseif probeCode == 31.2 then
+		ProbeSig = mc.ISIG_PROBE2
+	elseif probeCode == 31.3 then
+		ProbeSig = mc.ISIG_PROBE3
+	end
+	
+	local check = true --Default value of check
+	local hsig = mc.mcSignalGetHandle(inst, ProbeSig)
+	local ProbeState = mc.mcSignalGetState(hsig)
+	local errmsg = 'ERROR: No contact with probe' --Default error message
+	
+	if (ProbeState == 1) then --Change the error message
+		errmsg = 'ERROR: Unexpected probe touch'
+	end
+	
+	if (state == nil) then --We did not specify the value of the state parameter so lets return ProbeState
+		if (ProbeState == 1) then 
+			return (true);
+		else
+			return (false);
+		end
+	end
+	
+	if (ProbeState ~= state) then --CheckProbe failed
+		--mc.mcCntlSetLastError(inst, errmsg)
+		check = false
+	end
+	
+	return check
+end
+
+function Softlimits(mode)
+	for i = 0, mc.MC_MAX_AXES, 1 do --start, end, increment
+		if mc.mcAxisIsEnabled(inst, i) then
+			enable = mc.mcAxisGetSoftlimitEnable(inst, i)
+			if (enable) then
+				mc.mcSoftLimitSetState(inst, i, mode)
+			end
+		end
+	end
+end	
+
+function m231()
+	
+	-- find reasons not to do this operation
+	-- is machine homed?
+	if not isHomed () then return end
+	if toolSetterD == 0 then return end
+	-- is current tool in range?
+	local tool, rc = mc.mcToolGetCurrent(inst)
+	if rc ~= mc.MERROR_NOERROR or tool < 0 or tool > 99 then return end
+	
+	-- be careful
+	fastFeed = math.abs(fastFeed)
+	slowFeed = math.abs(slowFeed)
+	toolSetterD = math.abs(toolSetterD)
+	zOverShoot = math.abs(zOverShoot)
+	zRetract = math.abs(zRetract)
+	probeCode = math.abs(probeCode)
+	
+	local toolD, rc = mc.mcToolGetData(inst, mc.MTOOL_MILL_DIA, tool)
+	if tool == 0 then
+		toolD = bareSpindleD
+	elseif rc ~= mc.MERROR_NOERROR then
+		return
+	end
+	
+	local toolL = 0
+	local xSaved = toolSetterX
+	local ySaved = toolSetterY
+	local pointZ
+	local tLOState = mc.mcCntlGetPoundVar(inst, mc.SV_MOD_GROUP_8) -- current tool length offset state
+	
+	-- push control state to the stack saving original modes.
+	mc.mcCntlMachineStatePush(inst) 
+		
+	-- do we need to go outside soft limits to probe?
+	--Softlimits(mc.MC_OFF)
+	
+	-- probe center at fast feedrate
+	local gCode = "G00 G80 G40 G49 G90\n" -- safe start
+	gCode = gCode .. string.format("G90 G53 G0 Z%.4f\n", zSafe) --rapid to safe z
+	gCode = gCode .. string.format("G90 G53 G0 X%.4f Y%.4f\n", xSaved, ySaved) -- rapid to toolsetter x,y
+	mc.mcCntlGcodeExecuteWait(inst, gCode)
+	rc = CheckProbe(0) -- ensure probe is not touched
+	if not rc then return end
+	
+	gCode = string.format("G90 G53 G%.1f Z%.4f F%i\n", probeCode, zSafe + toolSetterZ - zOverShoot, fastFeed) -- probe -z
+	mc.mcCntlGcodeExecuteWait(inst, gCode)
+	rc = CheckProbe(1) -- ensure probe is touched
+	if not rc then return end
+	
+	pointZ, rc = mc.mcAxisGetProbePos(inst, mc.Z_AXIS, mc.MC_TRUE)
+	if rc ~= mc.MERROR_NOERROR then return end
+	toolL = pointZ - toolSetterZ
+	
+	-- do this operation if tool diameter is wider than tool setter
+	if toolD > toolSetterD then
+		local hyp = toolD / 2
+		local opp = toolSetterD / 2
+		local angle = math.asin(opp / hyp)
+		local points = math.floor(math.pi / angle) + 1
+		angle = math.pi / points
+		local pointX, pointY
+		
+		for i=0,points,1
+		do
+			pointX = toolSetterX + math.cos(angle * i) * hyp
+			pointY = toolSetterY - math.sin(angle * i) * hyp
+			
+			gCode = string.format("G91 G0 Z%.4f\n", zRetract) -- retract
+			gCode = gCode .. string.format("G90 G53 G0 X%.4f Y%.4f\n", pointX, pointY) -- rapid to point x,y
+			mc.mcCntlGcodeExecuteWait(inst, gCode)
+			rc = CheckProbe(0) -- ensure probe is not touched
+			if not rc then return end
+			
+			gCode = string.format("G90 G53 G%.1f Z%.4f F%i\n", probeCode, zSafe + pointZ - zOverShoot, fastFeed) -- probe -z, but we are only interested in longer tool length results
+			mc.mcCntlGcodeExecuteWait(inst, gCode)
+			rc = CheckProbe(1) -- ensure probe is touched
+			if not rc then
+				-- the tool geometry wasn't longer at this xy location
+			else
+				pointZ, rc = mc.mcAxisGetProbePos(inst, mc.Z_AXIS, mc.MC_TRUE)
+				if (pointZ - toolSetterZ) > toolL then
+					xSaved = pointX
+					ySaved = pointY
+					toolL = pointZ - toolSetterZ
+				end
+			end
+		end
+	end
+	
+	gCode = string.format("G91 G0 Z%.4f\n", zRetract) -- retract
+	gCode = gCode .. string.format("G90 G53 G0 X%.4f Y%.4f\n", xSaved, ySaved) -- rapid to saved x,y
+	mc.mcCntlGcodeExecuteWait(inst, gCode)
+	rc = CheckProbe(0) -- ensure probe is not touched
+	if not rc then return end
+	
+	gCode = string.format("G90 G53 G%.1f Z%.4f F%i\n", probeCode, zSafe + pointZ - zOverShoot, slowFeed) -- probe -z
+	mc.mcCntlGcodeExecuteWait(inst, gCode)
+	rc = CheckProbe(1) -- ensure probe is touched
+	if not rc then return end
+	
+	pointZ, rc = mc.mcAxisGetProbePos(inst, mc.Z_AXIS, mc.MC_TRUE)
+	toolL = pointZ - toolSetterZ
+	-- set tool length in table
+	mc.mcToolSetData(inst, mc.MTOOL_MILL_HEIGHT, tool, toolL)
+	mc.mcCntlSetLastError(inst, string.format("Tool %.0f Length Offset Set: %.4f", tool, toolL))
+	
+	if (tLOState ~= 49) then
+		mc.mcCntlGcodeExecuteWait(inst, string.format("G%.1f", tLOState))
+	end
+	
+	gCode = string.format("G90 G53 G0 Z%.4f\n", zSafe) -- retract to zSafe
+	mc.mcCntlGcodeExecuteWait(inst, gCode)
+	
+	-- restore the machine state stack to original modes.
+	-- do we need to return soft limits to previous state?
+	--Softlimits(mc.MC_ON)
+	mc.mcCntlMachineStatePop(inst);
+	
+end
+
+if (mc.mcInEditor() == 1) then
+	m231()
+end
