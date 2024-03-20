@@ -2,7 +2,7 @@ local inst = mc.mcGetInstance()
 
 local toolSetterX = 2360.0	--G53 position
 local toolSetterY =	1292.0	--G53 position
-local toolSetterZ = -158.1893	--G53 position
+local toolSetterZ = -155.7007	--G53 position
 
 local fastFeed = 1000.0
 local slowFeed = 250.0
@@ -144,7 +144,7 @@ function m231()
 	if toolD > toolSetterD then
 		local hyp = toolD / 2
 		local opp = toolSetterD / 2
-		local angle = math.asin(opp / hyp)
+		local angle = math.asin(opp / hyp) * 2
 		local points = math.floor(math.pi / angle) + 1
 		angle = math.pi / points
 		local pointX, pointY
